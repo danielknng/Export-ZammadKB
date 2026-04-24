@@ -60,6 +60,8 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
 When `-ApiToken` is provided, the script automatically switches to agent flavor. This includes internal and draft articles that are not publicly accessible. Attachment downloads also use the token in this mode.
 
+You can also just edit the .ps1 file directly if you prefer.
+
 ---
 
 ## Parameters
@@ -72,7 +74,7 @@ When `-ApiToken` is provided, the script automatically switches to agent flavor.
 | `-KBId` | `1` | Knowledge Base ID |
 | `-Flavor` | `public` | `public` or `agent` (auto-set when token is provided) |
 | `-PageSize` | `100` | Articles per API page |
-| `-ApiToken` | *(empty)* | Zammad API token — auto-switches to agent flavor when set |
+| `-ApiToken` | *(empty)* | Zammad API token - auto-switches to agent flavor when set |
 | `-DownloadAttachments` | `$true` | Set to `$false` to skip attachments |
 
 ---
