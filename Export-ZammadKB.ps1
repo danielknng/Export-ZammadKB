@@ -10,12 +10,23 @@
     downloads any file attachments alongside the article.
 
     Without an API token, only public articles are exported using the public
-    HTML endpoint (no authentication required).
+    HTML pages (no authentication required). The public search API returns no
+    category information, so the category hierarchy is read from the
+    breadcrumbs of each article page.
 
     When -ApiToken is provided, the flavor is automatically switched to "agent",
     which includes internal and draft articles. Article content is then fetched
-    via the authenticated REST API instead of the public HTML endpoint.
+    via the authenticated REST API instead of the public HTML pages.
     Attachment downloads also use the token in this mode.
+
+    The output contains no run-specific values such as export dates, so an
+    unchanged article produces an identical file on every run. Content-hash
+    based sync tools (e.g. oikb for Open WebUI) therefore only pick up real
+    changes.
+
+    The export is written to "<OutputPath>.new" first and swapped in when it
+    is complete. Articles deleted in Zammad disappear from the export, and a
+    failed run leaves the previous export untouched.
 
     Output folder structure mirrors the KB hierarchy:
         OutputPath/
@@ -25,13 +36,17 @@
                     Article Title_attachments/
                         file.pdf
 
+    Articles with the same title in the same folder get their answer ID
+    appended, e.g. "Article Title (123).md".
+
     Intended for importing into Open WebUI's Knowledge Base (RAG).
 
 .PARAMETER ZammadUrl
-    Base URL of your Zammad instance. No trailing slash.
+    Base URL of your Zammad instance.
 
 .PARAMETER OutputPath
-    Local folder where Markdown files will be saved.
+    Folder where the Markdown files will be saved. Its previous content is
+    replaced on every successful run.
 
 .PARAMETER Language
     KB locale to export. Must match what's configured in Zammad (e.g. "de-de").
@@ -55,44 +70,43 @@
     Set to $false to skip attachment downloads entirely.
 
 .EXAMPLE
-    .\Export-ZammadKB.ps1
+    .\Export-ZammadKB.ps1 -ZammadUrl "https://helpdesk.example.de"
 
 .EXAMPLE
     .\Export-ZammadKB.ps1 -OutputPath "C:\kb-export" -DownloadAttachments $false
 
 .EXAMPLE
-    .\Export-ZammadKB.ps1 -Flavor "agent" -ApiToken "your-token-here"
+    .\Export-ZammadKB.ps1 -ApiToken "your-token-here"
 
 .NOTES
     Author: danielknng
     Requires: PowerShell 7+
 #>
 
-# ── Configuration ─────────────────────────────────────────────────────────────
-
 param(
-    [string] $ZammadUrl           = "https://helpdesk.example.de",  # Your Zammad instance
-    [string] $OutputPath          = "C:\temp\zammad-kb-export",       # Where to save the files
-    [string] $Language            = "de-de",                          # KB language/locale
-    [int]    $KBId                = 1,                                 # Knowledge Base ID
-    [string] $Flavor              = "public",                          # "public" or "agent"
-    [int]    $PageSize            = 100,                               # Articles per API page
-    [string] $ApiToken            = "",                                # Only needed for agent flavor
-    [bool]   $DownloadAttachments = $true                              # Download attached files
+    [string] $ZammadUrl           = "https://helpdesk.example.de",
+    [string] $OutputPath          = "C:\temp\zammad-kb-export",
+    [string] $Language            = "de-de",
+    [int]    $KBId                = 1,
+    [ValidateSet("public", "agent")]
+    [string] $Flavor              = "public",
+    [int]    $PageSize            = 100,
+    [string] $ApiToken            = "",
+    [bool]   $DownloadAttachments = $true
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# If a token is provided, switch to agent flavor automatically to include
-# internal and draft articles. The user does not need to set this manually.
+$ZammadUrl  = $ZammadUrl.TrimEnd("/")
+$OutputPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputPath).TrimEnd("\", "/")
+$Utf8NoBom  = [System.Text.UTF8Encoding]::new($false)
+
 if ($ApiToken -and $Flavor -eq "public") {
     $Flavor = "agent"
-    Write-Host "  (ApiToken set – switching to agent flavor)" -ForegroundColor DarkGray
+    Write-Host "  (ApiToken set, switching to agent flavor)" -ForegroundColor DarkGray
 }
 
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
 function Get-Headers {
     $headers = @{ "Content-Type" = "application/json" }
@@ -100,36 +114,58 @@ function Get-Headers {
     return $headers
 }
 
+function ConvertFrom-HtmlText {
+    param([string] $Html)
+    $text = [System.Net.WebUtility]::HtmlDecode(($Html -replace '<[^>]+>', ''))
+    return ($text -replace '\s+', ' ').Trim()
+}
+
+# Restricted to characters that are valid on Windows and SMB shares, because exports
+# created on Linux are often copied there. -KeepExtension stops truncation from cutting
+# off the file type of long attachment names.
 function Get-SafeName {
-    param([string] $Name, [int] $MaxLength = 60)
-    $invalid = [System.IO.Path]::GetInvalidFileNameChars() -join ''
-    $result  = ($Name -replace "[{0}]" -f [RegEx]::Escape($invalid), '_').Trim('.')
-    if ([string]::IsNullOrWhiteSpace($result)) { $result = "_" }
-    if ($result.Length -gt $MaxLength) { $result = $result.Substring(0, $MaxLength).TrimEnd() }
-    return $result
+    param([string] $Name, [int] $MaxLength = 80, [switch] $KeepExtension)
+    $clean = ($Name -replace '[\x00-\x1f<>:"/\\|?*]', '_').Trim(' ', '.')
+    if (-not $clean) { return "_" }
+    if ($clean.Length -le $MaxLength) { return $clean }
+
+    $extension = if ($KeepExtension) { [System.IO.Path]::GetExtension($clean) } else { "" }
+    return $clean.Substring(0, $MaxLength - $extension.Length).TrimEnd(' ', '.') + $extension
 }
 
-# Splits "Category > Subcategory > .." into a clean path array.
-# Filters out ".." placeholders Zammad uses for missing hierarchy levels.
-function Get-CategoryPath {
+# Category hits appear in the same search results but have no answer ID in their URL.
+function Get-AnswerId {
+    param([string] $Url)
+    $match = [regex]::Match($Url, '/help/[^/]+/\d+[^/]*/(\d+)')
+    if ($match.Success) { return [int] $match.Groups[1].Value }
+    return $null
+}
+
+# Agent search results render the hierarchy as "Category > Subcategory > ..",
+# with ".." standing for elided levels.
+function Get-CategoryPathFromSubtitle {
     param([string] $Subtitle)
-    if ([string]::IsNullOrEmpty($Subtitle)) { return @("General") }
-    $s = $Subtitle -replace '&amp;','&' -replace '&gt;','>' -replace '&lt;','<' -replace '<[^>]+>',''
-    $parts = @(($s -split '\s*>\s*') | Where-Object { $_ -and $_.Trim() -notin @('..', '.', '') })
+    $parts = @((ConvertFrom-HtmlText $Subtitle) -split '\s*>\s*' | Where-Object { $_ -and $_ -notin @('.', '..') })
     if ($parts.Count -eq 0) { return @("General") }
-    return @($parts | ForEach-Object { $_.Trim() })
+    return $parts
 }
 
-function Get-ShortUrl {
-    param([string] $RelativeUrl)
-    if ($RelativeUrl -match '/help/[^/]+/(\d+)[^/]*/(\d+)') {
-        return "$ZammadUrl/help/$Language/$($Matches[1])/$($Matches[2])"
-    }
-    return "$ZammadUrl$RelativeUrl"
+# The public search API returns no category, so the hierarchy is read from the page breadcrumbs.
+# Only links of the form /help/<locale>/<id>-<slug> are categories; the KB root and the answer itself are skipped.
+function Get-CategoryPathFromPage {
+    param([string] $PageHtml)
+    $nav = [regex]::Match($PageHtml, '(?s)<nav class="breadcrumbs">(.*?)</nav>')
+    if (-not $nav.Success) { return @("General") }
+
+    $crumbs = [regex]::Matches($nav.Groups[1].Value, '(?s)<a class="breadcrumb" href="([^"]*)".*?<span>(.*?)</span>')
+    $parts  = @($crumbs |
+        Where-Object { $_.Groups[1].Value -match '^/help/[^/]+/\d+[^/]*$' } |
+        ForEach-Object { ConvertFrom-HtmlText $_.Groups[2].Value })
+
+    if ($parts.Count -eq 0) { return @("General") }
+    return $parts
 }
 
-
-# ── HTML to Markdown ──────────────────────────────────────────────────────────
 
 function ConvertTo-Markdown {
     param([string] $Html)
@@ -155,7 +191,7 @@ function ConvertTo-Markdown {
     $t = $t -replace '(?s)<pre[^>]*><code[^>]*>(.*?)</code></pre>', "``````\`n`$1\`n``````"
     $t = $t -replace '(?s)<code[^>]*>(.*?)</code>', '`$1`'
 
-    $t = $t -replace '(?s)<a[^>]*href="([^"]*)"[^>]*>(.*?)</a>', '[$2]($1)'
+    $t = $t -replace '(?s)<a[^>]*href=["'']([^"'']*)["''][^>]*>(.*?)</a>', '[$2]($1)'
     $t = $t -replace '(?s)<img[^>]*alt="([^"]*)"[^>]*src="([^"]*)"[^>]*/?>', '![$1]($2)'
     $t = $t -replace '(?s)<img[^>]*src="([^"]*)"[^>]*alt="([^"]*)"[^>]*/?>',  '![$2]($1)'
     $t = $t -replace '(?s)<img[^>]*src="([^"]*)"[^>]*/?>',                     '![]($1)'
@@ -190,65 +226,55 @@ function ConvertTo-Markdown {
     })
 
     $t = $t -replace '<[^>]+>', ''
-
-    $t = $t -replace '&amp;',     '&'
-    $t = $t -replace '&lt;',      '<'
-    $t = $t -replace '&gt;',      '>'
-    $t = $t -replace '&nbsp;',    ' '
-    $t = $t -replace '&quot;',    '"'
-    $t = $t -replace '&#39;',     "'"
-    $t = $t -replace '&#[0-9]+;', ''
-    $t = $t -replace '&[a-z]+;',  ''
-
+    $t = [System.Net.WebUtility]::HtmlDecode($t) -replace "\u00a0", ' '
     $t = $t -replace '(\r?\n\s*){3,}', "`n`n"
 
     return $t.Trim()
 }
 
-
-# ── Article content extraction ────────────────────────────────────────────────
-
 function Get-ArticleHtml {
     param([string] $PageHtml)
-    if ($PageHtml -match '(?s)<article[^>]*>(.*?)</article>')                  { return $Matches[1] }
-    if ($PageHtml -match '(?s)class="[^"]*answer[^"]*"[^>]*>(.*?)</section>') { return $Matches[1] }
-    if ($PageHtml -match '(?s)<main[^>]*>(.*?)</main>')                        { return $Matches[1] }
+    foreach ($pattern in @(
+        '(?s)<article[^>]*>(.*?)</article>',
+        '(?s)class="[^"]*answer[^"]*"[^>]*>(.*?)</section>',
+        '(?s)<main[^>]*>(.*?)</main>'
+    )) {
+        $match = [regex]::Match($PageHtml, $pattern)
+        if ($match.Success) { return $match.Groups[1].Value }
+    }
     return $PageHtml
 }
 
-# Finds all attachment links in the raw HTML.
 function Get-AttachmentLinks {
     param([string] $Html)
+    return @([regex]::Matches($Html, '/api/v1/attachments/(\d+)') |
+        ForEach-Object { [int] $_.Groups[1].Value } |
+        Sort-Object -Unique |
+        ForEach-Object {
+            [PSCustomObject]@{
+                RelativeUrl = "/api/v1/attachments/$_"
+                Id          = $_
+                FileName    = $null
+            }
+        })
+}
 
-    $matches = [regex]::Matches($Html, '(/api/v1/attachments/(\d+))')
-
-    $results = @()
-
-    foreach ($m in $matches) {
-        $id  = $m.Groups[2].Value
-        $url = $m.Groups[1].Value
-
-        $results += [PSCustomObject]@{
-            RelativeUrl = $url
-            Id          = $id
-            FileName    = "attachment_$id"
-        }
-    }
-
-    # Remove duplicates (same attachment may appear multiple times)
-    $results = $results | Sort-Object Id -Unique
-
-    return $results
+# Some pages are only a short teaser in the article body; the search snippet is
+# then at least as useful as the page content.
+function Get-SnippetMarkdown {
+    param($Detail, [string] $Url)
+    $body = [string] $Detail.PSObject.Properties['body']?.Value
+    return (ConvertTo-Markdown $body) + "`n`n> Preview only, see [full article]($Url)"
 }
 
 
-# ── Pagination ────────────────────────────────────────────────────────────────
-
-function Get-AllArticles {
+# Stops when a page brings no new results, which also guards against servers that ignore paging.
+function Get-AllArticleDetails {
     $all  = [System.Collections.Generic.List[object]]::new()
+    $seen = [System.Collections.Generic.HashSet[string]]::new()
     $page = 1
 
-    do {
+    while ($true) {
         $body = @{
             knowledge_base_id = $KBId
             locale            = $Language
@@ -259,267 +285,216 @@ function Get-AllArticles {
         } | ConvertTo-Json
 
         $result      = Invoke-RestMethod -Uri "$ZammadUrl/api/v1/knowledge_bases/search" -Method POST -Headers (Get-Headers) -Body $body
-        $pageDetails = @($result.details)
-
+        $pageDetails = @($result.details | Where-Object { $_ -and $seen.Add([string] $_.url) })
         if ($pageDetails.Count -eq 0) { break }
 
         $all.AddRange($pageDetails)
         Write-Host "     Page ${page}: $($pageDetails.Count) articles" -ForegroundColor DarkGray
 
-        if ($pageDetails.Count -lt $PageSize) { break }
+        if (@($result.details).Count -lt $PageSize) { break }
         $page++
-    } while ($true)
+    }
 
     return $all
 }
 
+function Get-PublicArticle {
+    param($Detail, [string] $Url)
+    $page     = (Invoke-WebRequest -Uri $Url -TimeoutSec 15).Content
+    $html     = Get-ArticleHtml $page
+    $markdown = ConvertTo-Markdown $html
+    if ($markdown.Length -lt 30) { $markdown = Get-SnippetMarkdown $Detail $Url }
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+    return [PSCustomObject]@{
+        CategoryPath = Get-CategoryPathFromPage $page
+        Markdown     = $markdown
+        Attachments  = if ($DownloadAttachments) { Get-AttachmentLinks $html } else { @() }
+    }
+}
+
+# Uses only the first translation, which is the only one in single-locale knowledge bases.
+function Get-AgentArticle {
+    param($Detail, [int] $AnswerId)
+    $answerUri = "$ZammadUrl/api/v1/knowledge_bases/$KBId/answers/$AnswerId"
+    $answer    = (Invoke-RestMethod -Uri $answerUri -Headers (Get-Headers) -TimeoutSec 15).assets.KnowledgeBaseAnswer."$AnswerId"
+
+    $translationId = @($answer.translation_ids)[0]
+    if (-not $translationId) { throw "No translation found for answer $AnswerId" }
+
+    $assets    = (Invoke-RestMethod -Uri "$answerUri`?include_contents=$translationId" -Headers (Get-Headers) -TimeoutSec 15).assets
+    $contentId = $assets.KnowledgeBaseAnswerTranslation."$translationId".content_id
+    $html      = $assets.KnowledgeBaseAnswerTranslationContent."$contentId".body
+
+    $attachments = @()
+    if ($DownloadAttachments) {
+        $attachments = @(@($answer.attachments) | Where-Object { $_ } | ForEach-Object {
+            [PSCustomObject]@{ RelativeUrl = $_.url; Id = $_.id; FileName = $_.filename }
+        })
+    }
+
+    return [PSCustomObject]@{
+        CategoryPath = Get-CategoryPathFromSubtitle ([string] $Detail.PSObject.Properties['subtitle']?.Value)
+        Markdown     = ConvertTo-Markdown $html
+        Attachments  = $attachments
+    }
+}
+
+function Get-Article {
+    param($Detail)
+    $answerId = Get-AnswerId $Detail.url
+    $url      = "$ZammadUrl$($Detail.url)"
+    $content  = if ($Flavor -eq "agent") { Get-AgentArticle $Detail $answerId } else { Get-PublicArticle $Detail $url }
+
+    return [PSCustomObject]@{
+        Id           = $answerId
+        Title        = ConvertFrom-HtmlText $Detail.title
+        Url          = $url
+        CategoryPath = @($content.CategoryPath)
+        Markdown     = $content.Markdown
+        Attachments  = @($content.Attachments)
+    }
+}
+
+
+# In agent mode the API provides the file name; public downloads only carry it in Content-Disposition.
+function Get-AttachmentFileName {
+    param($Attachment, $Response)
+    if ($Attachment.FileName) { return [string] $Attachment.FileName }
+
+    $disposition = [string] ($Response.Headers["Content-Disposition"] | Select-Object -First 1)
+    $match = [regex]::Match($disposition, 'filename\*?=(?:UTF-8'''')?(?:"([^"]+)"|([^\s;]+))')
+    if ($match.Success) {
+        $raw = if ($match.Groups[1].Value) { $match.Groups[1].Value } else { $match.Groups[2].Value }
+        return [System.Uri]::UnescapeDataString($raw)
+    }
+    return "attachment_$($Attachment.Id)"
+}
+
+# Returns the Markdown list entry for the attachment. Names that collide within one
+# article get the attachment ID appended so neither file is overwritten.
+function Save-Attachment {
+    param($Attachment, [string] $Folder, [System.Collections.Generic.HashSet[string]] $UsedNames)
+    $request = @{ Uri = "$ZammadUrl$($Attachment.RelativeUrl)"; TimeoutSec = 60; MaximumRedirection = 5 }
+    if ($Flavor -eq "agent") { $request["Headers"] = Get-Headers }
+    $response = Invoke-WebRequest @request
+
+    $name = Get-SafeName (Get-AttachmentFileName $Attachment $response) -KeepExtension
+    if (-not $UsedNames.Add($name)) {
+        $name = Get-SafeName ("{0} ({1}){2}" -f [System.IO.Path]::GetFileNameWithoutExtension($name), $Attachment.Id, [System.IO.Path]::GetExtension($name)) -KeepExtension
+        [void] $UsedNames.Add($name)
+    }
+
+    [System.IO.Directory]::CreateDirectory($Folder) | Out-Null
+    [System.IO.File]::WriteAllBytes((Join-Path $Folder $name), $response.RawContentStream.ToArray())
+    Write-Host "     Attachment: $name" -ForegroundColor DarkGray
+
+    $folderName = Split-Path $Folder -Leaf
+    return "- [$name](./$([System.Uri]::EscapeDataString($folderName))/$([System.Uri]::EscapeDataString($name)))"
+}
+
+# YAML values are written as JSON strings, which YAML accepts and which escapes quotes safely.
+function Get-ArticleDocument {
+    param($Article, [string[]] $AttachmentLines)
+    $frontMatter = @(
+        "---"
+        "title: $(ConvertTo-Json -InputObject $Article.Title)"
+        "category: $(ConvertTo-Json -InputObject @($Article.CategoryPath) -Compress)"
+        "source: $(ConvertTo-Json -InputObject $Article.Url)"
+        "---"
+    ) -join "`n"
+
+    $sections = @($frontMatter, "# $($Article.Title)", $Article.Markdown)
+    if ($AttachmentLines) { $sections += "## Attachments`n`n" + ($AttachmentLines -join "`n") }
+    return ($sections | Where-Object { $_ }) -join "`n`n"
+}
+
+# Titles that collide within one folder get the answer ID appended. Articles are processed
+# in answer ID order, so the resulting names are the same on every run.
+function Get-ArticleBasePath {
+    param($Article, [string] $Root, [System.Collections.Generic.HashSet[string]] $UsedPaths)
+    $folder = $Root
+    foreach ($segment in $Article.CategoryPath) { $folder = Join-Path $folder (Get-SafeName $segment) }
+
+    $basePath = Join-Path $folder (Get-SafeName $Article.Title)
+    if (-not $UsedPaths.Add($basePath)) {
+        $basePath = "$basePath ($($Article.Id))"
+        [void] $UsedPaths.Add($basePath)
+    }
+    return $basePath
+}
+
+function Write-Article {
+    param($Article, [string] $Root, [System.Collections.Generic.HashSet[string]] $UsedPaths)
+    $basePath = Get-ArticleBasePath $Article $Root $UsedPaths
+    $usedNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $attachmentLines = @($Article.Attachments | ForEach-Object { Save-Attachment $_ "${basePath}_attachments" $usedNames })
+
+    [System.IO.Directory]::CreateDirectory((Split-Path $basePath -Parent)) | Out-Null
+    [System.IO.File]::WriteAllText("$basePath.md", (Get-ArticleDocument $Article $attachmentLines) + "`n", $Utf8NoBom)
+    return $attachmentLines.Count
+}
+
+function Remove-Folder {
+    param([string] $Path)
+    if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Recurse -Force }
+}
+
+# Swapping a completely written folder keeps sync tools from ever seeing a half-finished export.
+function Publish-Export {
+    param([string] $Staging, [string] $Target)
+    $previous = "$Target.old"
+    Remove-Folder $previous
+    if (Test-Path -LiteralPath $Target) { Move-Item -LiteralPath $Target -Destination $previous }
+    Move-Item -LiteralPath $Staging -Destination $Target
+    Remove-Folder $previous
+}
+
 
 Write-Host ""
 Write-Host "  Zammad KB -> Markdown Export" -ForegroundColor Cyan
 Write-Host "  $ZammadUrl  ->  $OutputPath" -ForegroundColor DarkGray
 Write-Host ""
 
-New-Item -ItemType Directory -Force -Path $OutputPath | Out-Null
-
-
-# Step 1: Article list
-
 Write-Host "[1/3] Fetching article list..." -ForegroundColor Yellow
-$details = Get-AllArticles
+$details = @(Get-AllArticleDetails | Where-Object { Get-AnswerId $_.url } | Sort-Object { Get-AnswerId $_.url })
+if ($details.Count -eq 0) { throw "No articles found, previous export left untouched" }
 Write-Host "     $($details.Count) articles found in total" -ForegroundColor Green
 
+Write-Host "[2/3] Exporting articles..." -ForegroundColor Yellow
+$staging = "$OutputPath.new"
+Remove-Folder $staging
+[System.IO.Directory]::CreateDirectory($staging) | Out-Null
 
-# Step 2: Load content and find attachments
-
-Write-Host "[2/3] Loading article content..." -ForegroundColor Yellow
-
-$articles   = [System.Collections.Generic.List[object]]::new()
-$loadErrors = 0
-$counter    = 0
-
-foreach ($detail in $details) {
-    $counter++
-
-    $title = $detail.title -replace '</?em>','' -replace '<[^>]+>',''
-    $title = $title -replace '&amp;','&' -replace '&quot;','"' -replace '&#39;',"'" -replace '&gt;','>' -replace '&lt;','<'
-    $title = $title.Trim()
-
-    $categoryPath = Get-CategoryPath ([string]($detail.PSObject.Properties['subtitle']?.Value))
-    $url          = Get-ShortUrl $detail.url
-
-    Write-Host "   [$counter/$($details.Count)] $title" -ForegroundColor DarkGray -NoNewline
-
-    $markdown    = ""
-    $attachments = @()
-
-    try {
-        if ($Flavor -eq "agent") {
-            # Extract the article ID from the URL pattern /help/{locale}/{categoryId}/{articleId}
-            # Category URLs like /help/de-de/43-rechnungsbearbeitung have no article ID – skip them.
-            $articleId = $null
-            if ($detail.url -match '/help/[^/]+/\d+[^/]*/(\d+)') {
-                $articleId = $Matches[1]
-            }
-            if (-not $articleId) {
-                Write-Host "  SKIP (category)" -ForegroundColor DarkGray
-                continue
-            }
-
-            # First call to get the answer metadata and translation IDs
-            $apiAnswer     = Invoke-RestMethod -Uri "$ZammadUrl/api/v1/knowledge_bases/$KBId/answers/$articleId" -Headers (Get-Headers) -TimeoutSec 15
-            $answerAssets  = $apiAnswer.assets
-            $answerObj     = $answerAssets.KnowledgeBaseAnswer."$articleId"
-
-            # Use the first available translation (single-locale setups have exactly one)
-            $translationIds = @($answerObj.translation_ids)
-            if ($translationIds.Count -eq 0) {
-                throw "No translation IDs found for article $articleId"
-            }
-            $translationId = $translationIds[0]
-
-            # Second call with include_contents to get the HTML body
-            $apiContent    = Invoke-RestMethod -Uri "$ZammadUrl/api/v1/knowledge_bases/$KBId/answers/$articleId`?include_contents=$translationId" -Headers (Get-Headers) -TimeoutSec 15
-            $contentAssets = $apiContent.assets
-            $contentObj    = $contentAssets.KnowledgeBaseAnswerTranslation."$translationId"
-            $contentId     = $contentObj.content_id
-            $contentHtml   = $contentAssets.KnowledgeBaseAnswerTranslationContent."$contentId".body
-            $markdown      = ConvertTo-Markdown $contentHtml
-
-            # Attachments come directly from the answer object, no HTML scraping needed
-            if ($DownloadAttachments) {
-                $rawAtts = @($answerObj.attachments)
-                $attachments = $rawAtts | Where-Object { $_ } | ForEach-Object {
-                    [PSCustomObject]@{
-                        RelativeUrl = $_.url
-                        Id          = $_.id
-                        FileName    = $_.filename
-                    }
-                }
-                $attachments = @($attachments)
-            }
-        }
-        else {
-            $response    = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 15
-            $contentHtml = Get-ArticleHtml $response.Content
-            $markdown    = ConvertTo-Markdown $contentHtml
-
-            if ($DownloadAttachments) {
-                $attachments = @(Get-AttachmentLinks $contentHtml)
-            }
-
-            if ($markdown.Length -lt 30) {
-                $rawBody  = [string]($detail.PSObject.Properties['body']?.Value)
-                $markdown = ConvertTo-Markdown ($rawBody -replace '</?em>','')
-                $markdown += "`n`n> Preview only – [full article]($url)"
-            }
-        }
-
-        Write-Host "  OK" -ForegroundColor Green
-    }
-    catch {
-        Write-Host "  FAILED" -ForegroundColor Red
-        Write-Warning "  $url -> $_"
-        $rawBody  = [string]($detail.PSObject.Properties['body']?.Value)
-        $markdown = ConvertTo-Markdown ($rawBody -replace '</?em>','')
-        if ($url) { $markdown += "`n`n> Preview only – [full article]($url)" }
-        $loadErrors++
-    }
-
-    $articles.Add([PSCustomObject]@{
-        Title        = $title
-        Content      = $markdown
-        CategoryPath = $categoryPath
-        Url          = $url
-        Attachments  = $attachments
-    })
-}
-
-
-# Step 3: Write Markdown files and download attachments
-# No auth header is sent for attachments – they are publicly accessible
-# on public Zammad KB instances just like the article pages themselves.
-
-Write-Host "[3/3] Writing files..." -ForegroundColor Yellow
-
-$written         = 0
-$writeErrors     = 0
+$usedPaths       = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 $attachmentCount = 0
+$counter         = 0
 
-foreach ($article in $articles) {
-    try {
-		$categoryPath = @($article.CategoryPath)
-        # Build folder path from category hierarchy
-        $folder = $OutputPath
-        foreach ($segment in $categoryPath) {
-            $folder = Join-Path $folder (Get-SafeName $segment)
-        }
-        New-Item -ItemType Directory -Force -Path $folder | Out-Null
-
-        $filename = Get-SafeName $article.Title
-        $filepath = Join-Path $folder "$filename.md"
-
-        $suffix = 1
-        while (Test-Path $filepath) {
-            $filepath = Join-Path $folder "${filename}_${suffix}.md"
-            $suffix++
-        }
-
-        # Download attachments – no token needed for public KB
-        $attachmentMd = ""
-		$attachments = @($article.Attachments)
-        if ($attachments.Count -gt 0) {
-            $attachFolder = Join-Path $folder "${filename}_attachments"
-            New-Item -ItemType Directory -Force -Path $attachFolder | Out-Null
-
-            $attachmentLines = @()
-foreach ($att in $attachments) {
-    try {
-        $uri = "$ZammadUrl$($att.RelativeUrl)"
-
-        $attParams = @{
-            Uri               = $uri
-            TimeoutSec        = 60
-            MaximumRedirection = 5
-        }
-        if ($Flavor -eq "agent") { $attParams["Headers"] = Get-Headers }
-        $response = Invoke-WebRequest @attParams
-
-        # In agent mode the filename comes directly from the API.
-        # For public mode, read it from the Content-Disposition response header.
-        $fileName = $null
-        if ($att.PSObject.Properties['FileName'] -and $att.FileName -and $att.FileName -match '\.') {
-            $fileName = $att.FileName
-        }
-        else {
-            $cd = $response.Headers["Content-Disposition"]
-            if ($cd) {
-                $m = [regex]::Match($cd, 'filename\*?=(?:UTF-8'''')?(?:"([^"]+)"|([^\s;]+))')
-                if ($m.Success) {
-                    $fileName = if ($m.Groups[1].Value) { $m.Groups[1].Value } else { $m.Groups[2].Value }
-                    $fileName = [System.Uri]::UnescapeDataString($fileName.Trim('"'))
-                }
-            }
-        }
-        if (-not $fileName -or $fileName -notmatch '\.') {
-            $fileName = "attachment_$($att.Id)"
-        }
-
-        $attFile = Join-Path $attachFolder (Get-SafeName $fileName)
-
-        [System.IO.File]::WriteAllBytes($attFile, $response.Content)
-
-        $attachmentLines += "- [$fileName](./${filename}_attachments/$(Get-SafeName $fileName))"
-        $attachmentCount++
-
-        Write-Host "     Attachment: $fileName" -ForegroundColor DarkGray
-    }
-    catch {
-        Write-Warning "  Could not download attachment '$($att.Id)': $_"
-        $attachmentLines += "- attachment_$($att.Id) *(download failed)*"
+try {
+    foreach ($detail in $details) {
+        $counter++
+        $article = Get-Article $detail
+        Write-Host "   [$counter/$($details.Count)] $($article.Title)" -ForegroundColor DarkGray
+        $attachmentCount += Write-Article $article $staging $usedPaths
     }
 }
-
-            $attachmentMd = "`n`n## Attachments`n`n" + ($attachmentLines -join "`n")
-        }
-
-        @"
----
-title: "$($article.Title)"
-category: "$($categoryPath[0])"
-subcategory: "$(if ($categoryPath.Count -gt 1) { $categoryPath[1] } else { '' })"
-source: "$($article.Url)"
-exported: "$(Get-Date -Format "yyyy-MM-dd")"
----
-
-# $($article.Title)
-
-$($article.Content)$attachmentMd
-"@ | Out-File -FilePath $filepath -Encoding UTF8 -Force
-
-        $written++
-    }
-    catch {
-        Write-Warning "Failed to write '$($article.Title)': $_"
-        $writeErrors++
-    }
+catch {
+    Remove-Folder $staging
+    Write-Host "  FAILED at article $counter, previous export left untouched" -ForegroundColor Red
+    throw
 }
 
-
-# ── Summary ───────────────────────────────────────────────────────────────────
+Write-Host "[3/3] Replacing previous export..." -ForegroundColor Yellow
+Publish-Export $staging $OutputPath
 
 Write-Host ""
 Write-Host "  Done" -ForegroundColor Cyan
-Write-Host "  $written articles exported to: $OutputPath"
-if ($attachmentCount -gt 0) { Write-Host "  $attachmentCount attachments downloaded"      -ForegroundColor Green  }
-if ($loadErrors      -gt 0) { Write-Host "  $loadErrors articles used snippet fallback"    -ForegroundColor Yellow }
-if ($writeErrors     -gt 0) { Write-Host "  $writeErrors write errors"                     -ForegroundColor Red    }
+Write-Host "  $($details.Count) articles exported to: $OutputPath"
+if ($attachmentCount -gt 0) { Write-Host "  $attachmentCount attachments downloaded" -ForegroundColor Green }
 
 Write-Host ""
 Write-Host "  Folder overview:" -ForegroundColor DarkGray
-@(Get-ChildItem -Path $OutputPath -Directory) | ForEach-Object {
-    $count = @(Get-ChildItem $_.FullName -Recurse -Filter "*.md").Count
+@(Get-ChildItem -LiteralPath $OutputPath -Directory) | ForEach-Object {
+    $count = @(Get-ChildItem -LiteralPath $_.FullName -Recurse -Filter "*.md").Count
     Write-Host "    $($_.Name)/ ($count articles)" -ForegroundColor DarkGray
 }
 
